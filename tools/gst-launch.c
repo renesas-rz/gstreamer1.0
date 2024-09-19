@@ -1061,8 +1061,24 @@ alarm_awake ()
 
   if (count > 0 && timer == TRUE) {
     tptr = localtime (&t);
-    g_print ("FPS: %3d  TIME %02d:%02d:%02d\n", (int) framesinsec,
-        tptr->tm_hour, tptr->tm_min, tptr->tm_sec);
+
+    /* Write the output fps info to STDOUT
+     * Note that below operation can be replaced
+     * by a simple printf, but every kind of
+     * print is non-reentrant so it is not safe
+     * to use inside a signal handler */
+    gchar str[]="FPS: 000  TIME 00:00:00 ";
+    str[5] = framesinsec / 100 + '0';
+    str[6] = (framesinsec % 100) / 10 + '0';
+    str[7] = framesinsec % 10 + '0';
+    str[15] = tptr->tm_hour / 10 + '0';
+    str[16] = tptr->tm_hour % 10 + '0';
+    str[18] = tptr->tm_min / 10 + '0';
+    str[19] = tptr->tm_min % 10 + '0';
+    str[21] = tptr->tm_sec / 10 + '0';
+    str[22] = tptr->tm_sec % 10 + '0';
+    str[23] = '\n';
+    write (STDOUT_FILENO, str, sizeof(str));
   }
 
   past_count = count;
