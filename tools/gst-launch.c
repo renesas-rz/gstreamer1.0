@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/time.h>
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -46,6 +47,9 @@
 #endif
 #include <locale.h>             /* for LC_ALL */
 #include "tools.h"
+#include "gst/gstelement.h"
+#include "gst/gstpad.h"
+
 #ifdef HAVE_WINMM
 #include <mmsystem.h>
 #endif
@@ -94,6 +98,46 @@ static gboolean waiting_eos = FALSE;
 
 /* convenience macro so we don't have to litter the code with if(!quiet) */
 #define PRINT if(!quiet)gst_print
+
+GTimeVal start_time;
+GTimeVal end_time;
+GTimeVal diff_time;
+
+struct timeval s1time;
+struct timeval etime;
+struct timeval currenttime;
+struct timeval result;
+struct tm *ptm;
+long count = 0;
+long past_count = 0;
+struct itimerval val, curval;
+gboolean timer = FALSE;
+
+/* http://www.gnu.org/s/libc/manual/html_node/Elapsed-Time.html */
+int
+timeval_subtract (result, x, y)
+     struct timeval *result, *x, *y;
+{
+  /* Perform the carry for the later subtraction by updating y. */
+  if (x->tv_usec < y->tv_usec) {
+    int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+    y->tv_usec -= 1000000 * nsec;
+    y->tv_sec += nsec;
+  }
+  if (x->tv_usec - y->tv_usec > 1000000) {
+    int nsec = (x->tv_usec - y->tv_usec) / 1000000;
+    y->tv_usec += 1000000 * nsec;
+    y->tv_sec -= nsec;
+  }
+
+  /* Compute the time remaining to wait.
+     tv_usec is certainly positive. */
+  result->tv_sec = x->tv_sec - y->tv_sec;
+  result->tv_usec = x->tv_usec - y->tv_usec;
+
+  /* Return 1 if result is negative. */
+  return x->tv_sec < y->tv_sec;
+}
 
 #if defined (G_OS_UNIX) && !defined (__APPLE__)
 static void
@@ -1003,6 +1047,37 @@ bus_sync_handler (GstBus * bus, GstMessage * message, gpointer data)
   return GST_BUS_PASS;
 }
 
+void
+alarm_awake ()
+{
+  long framesinsec = 0;
+  static long past_count = 0;
+
+  struct tm *tptr;
+  time_t t = time (NULL);
+
+  /*g_print ("alarm ticked every second\n"); */
+  framesinsec = count - past_count;
+
+  if (count > 0 && timer == TRUE) {
+    tptr = localtime (&t);
+    g_print ("FPS: %3d  TIME %02d:%02d:%02d\n", (int) framesinsec,
+        tptr->tm_hour, tptr->tm_min, tptr->tm_sec);
+  }
+
+  past_count = count;
+}
+
+static gboolean
+cb_have_data_sink (GstPad * pad, GstBuffer * buffer, gpointer u_data)
+{
+  g_get_current_time (&end_time);
+  gettimeofday (&etime, NULL);
+  count = count + 1;
+
+  return TRUE;
+}
+
 static gboolean
 query_pipeline_position (gpointer user_data)
 {
@@ -1084,6 +1159,7 @@ real_main (int argc, char *argv[])
   gboolean check_index = FALSE;
 #endif
   gchar *savefile = NULL;
+  gchar *element_pad = NULL;
   gboolean no_position = FALSE;
   gboolean force_position = FALSE;
 #ifndef GST_DISABLE_OPTION_PARSING
@@ -1106,6 +1182,10 @@ real_main (int argc, char *argv[])
         N_("Do not install a fault handler"), NULL},
     {"eos-on-shutdown", 'e', 0, G_OPTION_ARG_NONE, &eos_on_shutdown,
         N_("Force EOS on sources before shutting the pipeline down"), NULL},
+    {"padprobe", 'p', 0, G_OPTION_ARG_STRING, &element_pad,
+        N_("Instrumentation metrics for calculating frames per second"), NULL},
+    {"timer", 'r', 0, G_OPTION_ARG_NONE, &timer,
+        N_("Display FPS timer every second"), NULL},
 #if 0
     {"index", 'i', 0, G_OPTION_ARG_NONE, &check_index,
         N_("Gather and print index statistics"), NULL},
@@ -1216,6 +1296,48 @@ real_main (int argc, char *argv[])
 
   loop = g_main_loop_new (NULL, FALSE);
 
+  if (element_pad) {
+    char e_name[50], e_pad[30];
+    GstElement *element = NULL;
+    GstPad *pad;
+    char *pch;
+    int l1, l2;
+
+    pch = strchr (element_pad, ':');
+    if (pch != NULL)
+      strncpy (e_name, element_pad, pch - element_pad + 1);
+    else {
+      g_print ("Couldn't find character ':'; -padprobe discarded.\n");
+      goto cont;
+    }
+
+    e_name[pch - element_pad] = '\0';
+    strcpy (e_pad, pch + 1);
+    l1 = strlen (e_name);
+    l2 = strlen (e_pad);
+
+    /*
+       g_printf (" element = %s %d\n", e_name, l1);
+       g_printf (" pad = %s %d\n", e_pad, l2);
+     */
+
+    element = gst_bin_get_by_name (GST_BIN (pipeline), e_name);
+    if (element == NULL) {
+      g_print ("Couldn't find element %s; -padprobe discarded.\n", e_name);
+    } else {
+      pad = gst_element_get_static_pad (element, e_pad);
+      if (pad == NULL) {
+        g_print ("Couldn't find pad %s; -padprobe discarded.\n", e_pad);
+      } else
+        gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER,
+            G_CALLBACK (cb_have_data_sink), NULL, NULL);
+      gst_object_unref (element);
+    }
+    /* TI change */
+  }
+
+cont:
+
   if (!savefile) {
     GstStateChangeReturn ret;
     GstBus *bus;
@@ -1293,6 +1415,17 @@ real_main (int argc, char *argv[])
         break;
     }
 
+      signal (SIGALRM, alarm_awake);
+
+      val.it_interval.tv_sec = 1;       /* ie. every second */
+      val.it_interval.tv_usec = 0;
+      val.it_value.tv_sec = 1;  /* initialise counter */
+      val.it_value.tv_usec = 0;
+
+      setitimer (ITIMER_REAL, &val, 0);
+
+      g_get_current_time (&start_time);
+
 #ifdef G_OS_UNIX
     signal_watch_intr_id =
         g_unix_signal_add (SIGINT, (GSourceFunc) intr_handler, pipeline);
@@ -1329,6 +1462,11 @@ real_main (int argc, char *argv[])
 
       if (GST_CLOCK_TIME_IS_VALID (tfthen)) {
         tfnow = gst_util_get_timestamp ();
+ 
+        g_get_current_time (&end_time);
+
+        signal (SIGALRM, SIG_IGN);
+
         diff = GST_CLOCK_DIFF (tfthen, tfnow);
 
         PRINT (_("Execution ended after %" GST_TIME_FORMAT "\n"),
@@ -1364,6 +1502,19 @@ real_main (int argc, char *argv[])
     /* Undo timeBeginPeriod() if required */
     clear_winmm_timer_resolution (winmm_timer_resolution);
 #endif
+  }
+
+  timeval_subtract (&diff_time, &end_time, &start_time);
+  g_print ("Total time: %lf seconds\n",
+      (float) diff_time.tv_sec + (float) diff_time.tv_usec / G_USEC_PER_SEC);
+
+  if (element_pad) {
+    g_print ("Frames: %d processed\n", (int) count);
+
+    /* g_print ("Avg. FPS: %.2lf\n", (float) ((float)count / ((float)diff_time.tv_sec)+(float)diff_time.tv_usec) ); */
+    g_print ("Avg. FPS: %.2lf\n",
+        (float) (count / (float) (diff_time.tv_sec * G_USEC_PER_SEC +
+                diff_time.tv_usec) * G_USEC_PER_SEC));
   }
 
   PRINT (_("Freeing pipeline ...\n"));
